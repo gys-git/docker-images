@@ -1,0 +1,968 @@
+# OceanSeek single-host trial (Linux AMD64)
+# Requires Docker Engine 24+, Docker Compose v2.23.1+, and access to quay.io.
+# The host needs 12 vCPUs, 32 GiB of available memory, and 250 GiB of free SSD space for Docker's data directory.
+# Allow 3 vCPUs, 10 GiB of memory, and 50 GiB of local disk for OBServer.
+# Each of the three LogService instances needs 2 vCPUs, 4 GiB of memory, and 20 GiB of local disk.
+# Docker named volumes grow on demand. Leave the remaining disk space for MinIO, monitoring, images, and the OS.
+#
+# From this file's directory, run the following to start OceanSeek and print the connection details.
+#   docker compose up -d && docker compose logs --no-log-prefix observer-bootstrap
+# Open the printed obshell URL in your browser and sign in as root. To read the initial password in a private terminal, run:
+#   sudo docker compose exec observer cat /run/secrets/ob_root_password
+# By default, Docker publishes SQL on TCP port 32881 and obshell on TCP port 32886 on all host IPv4 addresses.
+# Clients must be able to reach those ports. For hosts behind NAT, configure port forwarding on the upstream network.
+# To use different ports, export OBSERVER_SQL_HOST_PORT or OBSHELL_HOST_PORT before startup.
+# On hosts with multiple network interfaces, set HOST_ACCESS_IP to choose the address shown for ports bound to all interfaces.
+#
+# New installations need no .env file. Docker allocates the subnet automatically.
+# For an existing fixed-IP deployment, keep using its original Compose file until you migrate the data.
+# To stop and keep the data, run docker compose stop -t 120. Resume with docker compose up -d in the same directory.
+# To remove the containers and network, run docker compose down -t 120. Run docker compose up -d with the same project to reuse its volumes.
+name: ${COMPOSE_PROJECT_NAME:-oceanseek}
+
+x-logservice: &logservice
+  image: quay.io/oceanbase/logservice:1.3.3-152026112014
+  platform: linux/amd64
+  entrypoint: ["bash", "/opt/oceanseek/logservice-entrypoint.sh"]
+  restart: unless-stopped
+  cpus: ${LOGSERVICE_CPUS:-2}
+  mem_limit: ${LOGSERVICE_CONTAINER_MEMORY:-4g}
+  stop_grace_period: 60s
+  configs:
+    - source: logservice-entrypoint
+      target: /opt/oceanseek/logservice-entrypoint.sh
+  network_mode: service:cluster-network
+  # A retained LogService store reads its checkpoints from the bucket on startup.
+  depends_on:
+    minio-init: {condition: service_completed_successfully}
+  healthcheck:
+    test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/localhost/$${HTTP_PORT}"]
+    interval: 5s
+    timeout: 3s
+    retries: 120
+  logging: &bounded-logging
+    driver: json-file
+    options: {max-size: "10m", max-file: "3"}
+
+x-logservice-env: &logservice-env
+  TZ: Asia/Shanghai
+  CLUSTER_ID: ${LOGSERVICE_CLUSTER_ID:-10002}
+  LOG_DISK_SIZE: ${LOGSERVICE_LOG_DISK_SIZE:-9G}
+  MEMORY_LIMIT: ${LOGSERVICE_MEMORY_LIMIT:-3686M}
+
+services:
+  credentials-init:
+    image: &client-image quay.io/sclorg/mariadb-105-c9s:20261118
+    platform: linux/amd64
+    entrypoint: ["bash", "/opt/oceanseek/credentials.sh"]
+    user: "0:0"
+    restart: "no"
+    network_mode: none
+    configs:
+      - source: credentials
+        target: /opt/oceanseek/credentials.sh
+    volumes:
+      - credentials:/run/secrets
+    logging: *bounded-logging
+
+  # The engines persist numeric member addresses. On a single host they share
+  # loopback, with a distinct port per member. Only the bridge IP is ephemeral.
+  cluster-network:
+    image: *client-image
+    platform: linux/amd64
+    entrypoint: ["sleep", "infinity"]
+    init: true
+    restart: unless-stopped
+    networks:
+      oceanseek:
+        aliases: [observer, logservice-1, logservice-2, logservice-3]
+    ports:
+      - "${OBSERVER_SQL_BIND_ADDRESS:-0.0.0.0}:${OBSERVER_SQL_HOST_PORT:-32881}:2881"
+      - "${OBSHELL_BIND_ADDRESS:-0.0.0.0}:${OBSHELL_HOST_PORT:-32886}:2886"
+    logging: *bounded-logging
+
+  minio:
+    image: quay.io/oceanbase/minio:RELEASE.2025-10-15T17-29-55Z
+    platform: linux/amd64
+    entrypoint: ["sh", "/opt/oceanseek/minio-entrypoint.sh"]
+    user: "0:0"
+    restart: unless-stopped
+    mem_limit: ${MINIO_MEMORY:-1g}
+    environment:
+      MINIO_DOMAIN: minio
+    configs:
+      - source: minio-entrypoint
+        target: /opt/oceanseek/minio-entrypoint.sh
+    volumes:
+      - minio-data:/data
+      - credentials:/run/secrets:ro
+    depends_on:
+      credentials-init: {condition: service_completed_successfully}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+    networks:
+      oceanseek:
+        # S3 clients may use virtual-hosted bucket addressing for DNS endpoints.
+        aliases:
+          - "${LOGSERVICE_BUCKET:-oceanseek-logservice}.minio"
+          - "${SHARED_STORAGE_BUCKET:-oceanseek-data}.minio"
+    logging: *bounded-logging
+
+  minio-init:
+    image: quay.io/oceanbase/mc:RELEASE.2025-08-13T08-35-41Z
+    platform: linux/amd64
+    entrypoint: ["sh", "/opt/oceanseek/minio-init.sh"]
+    user: "0:0"
+    restart: "no"
+    environment:
+      LOGSERVICE_BUCKET: ${LOGSERVICE_BUCKET:-oceanseek-logservice}
+      SHARED_STORAGE_BUCKET: ${SHARED_STORAGE_BUCKET:-oceanseek-data}
+    configs:
+      - source: minio-init
+        target: /opt/oceanseek/minio-init.sh
+    volumes:
+      - credentials:/run/secrets:ro
+    depends_on:
+      minio: {condition: service_healthy}
+    networks: [oceanseek]
+    logging: *bounded-logging
+
+  logservice-1:
+    <<: *logservice
+    environment:
+      <<: *logservice-env
+      RPC_PORT: "50051"
+      HTTP_PORT: "50052"
+    volumes:
+      - logservice-1-store:/home/admin/oblogservice/store
+      - logservice-1-log:/home/admin/oblogservice/log
+
+  logservice-2:
+    <<: *logservice
+    environment:
+      <<: *logservice-env
+      RPC_PORT: "50053"
+      HTTP_PORT: "50054"
+    volumes:
+      - logservice-2-store:/home/admin/oblogservice/store
+      - logservice-2-log:/home/admin/oblogservice/log
+
+  logservice-3:
+    <<: *logservice
+    environment:
+      <<: *logservice-env
+      RPC_PORT: "50055"
+      HTTP_PORT: "50056"
+    volumes:
+      - logservice-3-store:/home/admin/oblogservice/store
+      - logservice-3-log:/home/admin/oblogservice/log
+
+  logservice-bootstrap:
+    image: quay.io/oceanbase/logservice:1.3.3-152026112014
+    platform: linux/amd64
+    entrypoint: ["bash", "/opt/oceanseek/logservice-bootstrap.sh"]
+    user: "0:0"
+    restart: "no"
+    environment:
+      LOGSERVICE_CLUSTER_ID: ${LOGSERVICE_CLUSTER_ID:-10002}
+      TZ: Asia/Shanghai
+      LOGSERVICE_BUCKET_URL: s3://${LOGSERVICE_BUCKET:-oceanseek-logservice}?host=http://minio:9000&s3_region=${S3_REGION:-us-east-1}
+      REGION_NAME: ${REGION_NAME:-region1}
+      ZONE_NAME_1: ${ZONE_NAME:-zone1}-1
+      ZONE_NAME_2: ${ZONE_NAME:-zone1}-2
+      ZONE_NAME_3: ${ZONE_NAME:-zone1}-3
+    configs:
+      - source: logservice-bootstrap
+        target: /opt/oceanseek/logservice-bootstrap.sh
+    volumes:
+      - credentials:/run/secrets:ro
+    depends_on:
+      minio-init: {condition: service_completed_successfully}
+      logservice-1: {condition: service_healthy}
+      logservice-2: {condition: service_healthy}
+      logservice-3: {condition: service_healthy}
+    networks: [oceanseek]
+    logging: *bounded-logging
+
+  observer:
+    image: quay.io/oceanbase/oceanseek:4.6.3.0-482026112114
+    platform: linux/amd64
+    entrypoint: ["bash", "/opt/oceanseek/observer-entrypoint.sh"]
+    restart: unless-stopped
+    cpus: ${OBSERVER_CPUS:-3}
+    mem_limit: ${OBSERVER_CONTAINER_MEMORY:-10g}
+    stop_grace_period: 90s
+    environment:
+      CLUSTER_NAME: ${CLUSTER_NAME:-oceanseek-compose}
+      TZ: Asia/Shanghai
+      CLUSTER_ID: ${OBSERVER_CLUSTER_ID:-10001}
+      ZONE_NAME: ${ZONE_NAME:-zone1}
+      AUTO_REGISTER_MONITORING: ${AUTO_REGISTER_MONITORING:-true}
+      PROMETHEUS_INTERNAL_URL: ${PROMETHEUS_INTERNAL_URL:-http://prometheus:9090/}
+      ALERTMANAGER_INTERNAL_URL: ${ALERTMANAGER_INTERNAL_URL:-http://alertmanager:9093}
+      MONITORING_REGISTER_TIMEOUT_SECONDS: ${MONITORING_REGISTER_TIMEOUT_SECONDS:-600}
+      CPU_COUNT: ${OBSERVER_CPU_COUNT:-3}
+      DATAFILE_SIZE: ${OBSERVER_DATAFILE_SIZE:-10G}
+      DATAFILE_MAXSIZE: ${OBSERVER_DATAFILE_MAXSIZE:-38G}
+      DATAFILE_NEXT: ${OBSERVER_DATAFILE_NEXT:-4G}
+      MEMORY_LIMIT: ${OBSERVER_MEMORY_LIMIT:-9G}
+    configs:
+      - source: observer-entrypoint
+        target: /opt/oceanseek/observer-entrypoint.sh
+      - source: obshell-monitoring-register
+        target: /opt/oceanseek/obshell-monitoring-register.sh
+    volumes:
+      - observer-data:/home/admin/data-file
+      - observer-log:/home/admin/log
+      - credentials:/run/secrets:ro
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/2881 && { test ! -f /run/secrets/observer_bootstrap_complete || exec 4<>/dev/tcp/127.0.0.1/2886; }"]
+      interval: 5s
+      timeout: 3s
+      retries: 180
+    depends_on:
+      logservice-bootstrap: {condition: service_completed_successfully}
+    network_mode: service:cluster-network
+    logging: *bounded-logging
+
+  host-info-init:
+    image: &alertmanager-image quay.io/prometheus/alertmanager:v0.27.0
+    platform: linux/amd64
+    network_mode: host
+    entrypoint: ["sh", "/opt/oceanseek/host-info-init.sh"]
+    user: "0:0"
+    restart: "no"
+    cap_drop: [ALL]
+    environment:
+      HOST_ACCESS_IP: ${HOST_ACCESS_IP:-}
+      OBSERVER_SQL_BIND_ADDRESS: ${OBSERVER_SQL_BIND_ADDRESS:-0.0.0.0}
+      OBSHELL_BIND_ADDRESS: ${OBSHELL_BIND_ADDRESS:-0.0.0.0}
+    configs:
+      - source: host-info-init
+        target: /opt/oceanseek/host-info-init.sh
+    volumes:
+      - connection-info:/run/oceanseek
+    logging: *bounded-logging
+
+  observer-bootstrap:
+    image: *client-image
+    platform: linux/amd64
+    user: "0:0"
+    entrypoint: ["timeout", "${BOOTSTRAP_TIMEOUT:-30m}", "bash", "/opt/oceanseek/observer-bootstrap.sh"]
+    restart: "no"
+    environment:
+      OBSERVER_HOST: observer
+      OBSERVER_SQL_HOST_PORT: ${OBSERVER_SQL_HOST_PORT:-32881}
+      OBSHELL_HOST_PORT: ${OBSHELL_HOST_PORT:-32886}
+      ZONE_NAME: ${ZONE_NAME:-zone1}
+      LOGSERVICE_CLUSTER_ID: ${LOGSERVICE_CLUSTER_ID:-10002}
+      LOGSERVICE_BUCKET_URL: s3://${LOGSERVICE_BUCKET:-oceanseek-logservice}?host=http://minio:9000&s3_region=${S3_REGION:-us-east-1}
+      SHARED_STORAGE_BUCKET_URL: s3://${SHARED_STORAGE_BUCKET:-oceanseek-data}?host=http://minio:9000&s3_region=${S3_REGION:-us-east-1}
+    configs:
+      - source: observer-bootstrap
+        target: /opt/oceanseek/observer-bootstrap.sh
+    volumes:
+      - credentials:/run/secrets
+      - connection-info:/run/oceanseek:ro
+    depends_on:
+      observer: {condition: service_healthy}
+      host-info-init: {condition: service_completed_successfully}
+    networks: [oceanseek]
+    logging: *bounded-logging
+
+  obagent:
+    image: quay.io/oceanbase/obagent:4.2.6-100000152026051118
+    platform: linux/amd64
+    networks: [oceanseek]
+    entrypoint: ["bash", "/opt/oceanseek/obagent-entrypoint.sh"]
+    restart: unless-stopped
+    cpus: ${OBAGENT_CPUS:-0.5}
+    mem_limit: ${OBAGENT_MEMORY:-512m}
+    environment:
+      # Match the SVR_IP recorded in OceanBase monitoring views.
+      HOST_IP: 127.0.0.1
+      CLUSTER_ID: ${OBSERVER_CLUSTER_ID:-10001}
+      CLUSTER_NAME: ${CLUSTER_NAME:-oceanseek-compose}
+      ZONE_NAME: ${ZONE_NAME:-zone1}
+      MONITOR_USER: monitor
+    configs:
+      - source: obagent-entrypoint
+        target: /opt/oceanseek/obagent-entrypoint.sh
+    volumes:
+      - credentials:/run/secrets:ro
+    depends_on:
+      observer-bootstrap: {condition: service_completed_successfully}
+    healthcheck:
+      test:
+        - CMD
+        - bash
+        - -eo
+        - pipefail
+        - -c
+        - |
+          exec 3<>/dev/tcp/observer/2881
+          curl -fsS http://obagent:8088/metrics/ob/basic | grep '^ob_sysstat{' >/dev/null
+      interval: 5s
+      timeout: 3s
+      start_period: 5m
+      retries: 3
+    logging: *bounded-logging
+
+  alertmanager:
+    image: *alertmanager-image
+    platform: linux/amd64
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    configs:
+      - source: alertmanager
+        target: /etc/alertmanager/alertmanager.yml
+    volumes:
+      - alertmanager-data:/alertmanager
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9093/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+    networks: [oceanseek]
+    logging: *bounded-logging
+
+  prometheus:
+    image: quay.io/prometheus/prometheus:v2.51.1
+    platform: linux/amd64
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    configs:
+      - source: prometheus
+        target: /etc/prometheus/prometheus.yml
+    volumes:
+      - prometheus-data:/prometheus
+    depends_on:
+      obagent: {condition: service_healthy, restart: true}
+      alertmanager: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:9090/-/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+    networks: [oceanseek]
+    logging: *bounded-logging
+
+volumes:
+  connection-info:
+  credentials:
+  minio-data:
+  logservice-1-store:
+  logservice-1-log:
+  logservice-2-store:
+  logservice-2-log:
+  logservice-3-store:
+  logservice-3-log:
+  observer-data:
+  observer-log:
+  prometheus-data:
+  alertmanager-data:
+
+networks:
+  oceanseek: {}
+
+configs:
+  host-info-init:
+    content: |
+      #!/bin/sh
+      set -eu
+
+      published_host() {
+        # For a wildcard bind, query the route in the host network namespace.
+        # This only looks up the route and sends no traffic to the probe address.
+        case "$$1" in
+          0.0.0.0) family=-4; probe=1.1.1.1; loopback=127.0.0.1 ;;
+          ::|'[::]') family=-6; probe=2606:4700:4700::1111; loopback=::1 ;;
+          *)
+            host_ip=$${1#[}
+            printf '%s\n' "$${host_ip%]}"
+            return
+            ;;
+        esac
+        host_ip=$${HOST_ACCESS_IP:-}
+        if [ -z "$$host_ip" ]; then
+          set -- $$(ip "$$family" route get "$$probe" 2>/dev/null)
+          while [ "$$#" -gt 1 ]; do
+            if [ "$$1" = src ]; then
+              host_ip=$$2
+              break
+            fi
+            shift
+          done
+        fi
+        case "$$host_ip" in
+          '') host_ip=$$loopback ;;
+          *[!0-9A-Fa-f:.]*) echo "Invalid HOST_ACCESS_IP: expected an IP address" >&2; return 1 ;;
+        esac
+        printf '%s\n' "$$host_ip"
+      }
+
+      target=/run/oceanseek/published-hosts
+      temporary=$$(mktemp "$${target}.tmp.XXXXXX")
+      trap 'rm -f "$$temporary"' EXIT HUP INT TERM
+      published_host "$$OBSERVER_SQL_BIND_ADDRESS" > "$$temporary"
+      published_host "$$OBSHELL_BIND_ADDRESS" >> "$$temporary"
+      mv -f "$$temporary" "$$target"
+      trap - EXIT HUP INT TERM
+
+  logservice-entrypoint:
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      home=/home/admin/oblogservice
+      store_dir="$${home}/store"
+      log_dir="$${home}/log"
+      persist_etc="$${store_dir}/etc"
+      local_storage="$${store_dir}/data"
+
+      mkdir -p "$${persist_etc}" "$${local_storage}" "$${log_dir}"
+      if [[ ! -f "$${persist_etc}/config.toml" ]]; then
+        cp "$${home}"/etc/*.yml "$${persist_etc}/" 2>/dev/null || true
+      fi
+      rm -rf "$${home:?}/etc"
+      ln -s "$${persist_etc}" "$${home}/etc"
+
+      args=()
+      if [[ ! -f "$${persist_etc}/config.toml" ]]; then
+        args=(-g "cluster_id=$${CLUSTER_ID},local_ip=127.0.0.1,rpc_port=$${RPC_PORT},http_port=$${HTTP_PORT},local_storage_dir=$${local_storage},log_disk_size=$${LOG_DISK_SIZE},memory_limit=$${MEMORY_LIMIT}")
+      fi
+
+      "$${home}/bin/oblogservice" "$${args[@]}"
+
+      # Procfs is part of the Linux runtime; do not depend on optional procps/pgrep.
+      find_daemon_pid() {
+        local stat_file stat_line process_state candidate oldest=""
+        [[ -r /proc/self/stat ]] || { echo "cannot inspect /proc/self/stat" >&2; return 1; }
+        for stat_file in /proc/[0-9]*/stat; do
+          IFS= read -r stat_line < "$${stat_file}" 2>/dev/null || continue
+          [[ "$${stat_line#* (}" == oblogservice\)\ * ]] || continue
+          process_state="$${stat_line##*) }"
+          process_state="$${process_state%% *}"
+          [[ "$${process_state}" != Z && "$${process_state}" != X ]] || continue
+          candidate="$${stat_file%/stat}"
+          candidate="$${candidate##*/}"
+          if [[ -z "$${oldest}" ]] || (( candidate < oldest )); then oldest="$${candidate}"; fi
+        done
+        printf '%s' "$${oldest}"
+      }
+
+      deadline=$$((SECONDS + 300))
+      pid=""
+      while (( SECONDS < deadline )); do
+        pid="$$(find_daemon_pid)" || { echo "failed to inspect LogService processes" >&2; exit 1; }
+        [[ -n "$${pid}" ]] && break
+        sleep 1
+      done
+      if [[ -z "$${pid}" ]]; then
+        echo "oblogservice daemon did not start" >&2
+        exit 1
+      fi
+
+      daemon_running() {
+        local stat_line state
+        IFS= read -r stat_line < "/proc/$${pid}/stat" 2>/dev/null || return 1
+        state="$${stat_line##*) }"; state="$${state%% *}"
+        [[ "$$state" != Z && "$$state" != X ]]
+      }
+      stop_daemon() {
+        trap '' TERM INT
+        echo "Stopping LogService pid $${pid}" >&2
+        kill -TERM "$${pid}" 2>/dev/null || true
+        local stop_deadline=$$((SECONDS + 20))
+        while daemon_running && (( SECONDS < stop_deadline )); do sleep 0.1; done
+        if daemon_running; then
+          echo "WARNING: LogService did not stop within 20s; forcing SIGKILL" >&2
+          kill -KILL "$${pid}" 2>/dev/null || true
+          stop_deadline=$$((SECONDS + 3))
+          while daemon_running && (( SECONDS < stop_deadline )); do sleep 0.1; done
+        fi
+        if daemon_running; then echo "LogService remains alive after SIGKILL" >&2; exit 1; fi
+        exit 0
+      }
+      trap 'stop_daemon' TERM INT
+
+      while daemon_running; do
+        sleep 5 &
+        wait $$! || true
+      done
+      wait "$${pid}" 2>/dev/null || true
+      echo "oblogservice daemon exited" >&2
+      false
+  credentials:
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      umask 077
+      cd /run/secrets
+      chmod 0700 .
+      marker=.initialized
+      if [[ -e $$marker ]]; then
+        case "$$(cat "$$marker")" in
+          v3) ;;
+          v2) echo "These volumes contain the previous bridge-IP layout. Restore the original Compose file for this project before migrating." >&2; exit 1 ;;
+          *) echo "Unsupported credential volume format" >&2; exit 1 ;;
+        esac
+      fi
+      tmp=""
+      trap '[[ -z $$tmp ]] || rm -f "$$tmp"' EXIT
+      for key in minio_access_id minio_access_key ob_root_password ob_monitor_password; do
+        if [[ -s $$key ]]; then continue; fi
+        if [[ -e $$marker || -e $$key ]]; then
+          echo "Missing or empty $$key. Restore the credential volume." >&2
+          exit 1
+        fi
+        bytes=24
+        if [[ $$key == minio_access_id ]]; then bytes=10; fi
+        # Publish each complete credential atomically on the same volume.
+        tmp=$$(mktemp .credential.XXXXXX)
+        od -An -v -N "$$bytes" -tx1 /dev/urandom | tr -d ' \n' > "$$tmp"
+        echo >> "$$tmp"
+        ln "$$tmp" "$$key"
+        rm "$$tmp"
+      done
+      tmp=$$(mktemp .marker.XXXXXX)
+      echo v3 > "$$tmp"
+      mv "$$tmp" "$$marker"
+  minio-entrypoint:
+    content: |
+      #!/usr/bin/env sh
+      set -eu
+
+      MINIO_ROOT_USER="$$(cat /run/secrets/minio_access_id)"
+      MINIO_ROOT_PASSWORD="$$(cat /run/secrets/minio_access_key)"
+      export MINIO_ROOT_USER MINIO_ROOT_PASSWORD
+      exec minio server /data --console-address :9001
+  minio-init:
+    content: |
+      #!/usr/bin/env sh
+      set -eu
+
+      access_id="$$(cat /run/secrets/minio_access_id)"
+      access_key="$$(cat /run/secrets/minio_access_key)"
+      attempt=0
+      until mc alias set oceanseek http://minio:9000 "$${access_id}" "$${access_key}" >/dev/null 2>&1; do
+        attempt=$$((attempt + 1))
+        if [ "$${attempt}" -ge 150 ]; then
+          echo "MinIO initialization failed after 150 attempts" >&2
+          exit 1
+        fi
+        sleep 2
+      done
+      mc mb --ignore-existing "oceanseek/$${LOGSERVICE_BUCKET}"
+      mc mb --ignore-existing "oceanseek/$${SHARED_STORAGE_BUCKET}"
+  logservice-bootstrap:
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      access_id="$$(cat /run/secrets/minio_access_id)"
+      access_key="$$(cat /run/secrets/minio_access_key)"
+      object_store_url="$${LOGSERVICE_BUCKET_URL}&access_id=$${access_id}&access_key=$${access_key}"
+      nodes="REGION $${REGION_NAME} AZ $${ZONE_NAME_1} SERVER 127.0.0.1:50051, REGION $${REGION_NAME} AZ $${ZONE_NAME_2} SERVER 127.0.0.1:50053, REGION $${REGION_NAME} AZ $${ZONE_NAME_3} SERVER 127.0.0.1:50055"
+
+      # ls_ctrl requires a numeric SocketAddr even for its HTTP client.
+      control_ip=$$(getent ahostsv4 logservice-1 | awk 'NR == 1 {print $$1}')
+      [[ -n "$$control_ip" ]] || { echo "Cannot resolve logservice-1" >&2; exit 1; }
+      for attempt in $$(seq 1 60); do
+        if access_point=$$(/home/admin/oblogservice/bin/ls_ctrl --host "$${control_ip}:50052" show ap 2>/dev/null); then
+          if grep -Eq "\"cluster_id\":[[:space:]]*$${LOGSERVICE_CLUSTER_ID}([,}])" <<<"$${access_point}"; then
+            echo "LogService is already bootstrapped"
+            exit 0
+          fi
+          echo "LogService endpoint belongs to a different cluster" >&2
+          exit 1
+        fi
+        # A retained cluster can accept HTTP before its access point is ready.
+        if [[ -f /run/secrets/observer_bootstrap_complete ]]; then
+          sleep 5
+          continue
+        fi
+        if output=$$(/home/admin/oblogservice/bin/ls_ctrl \
+          --host "$${control_ip}:50052" \
+          bootstrap \
+          --object-store-url "$${object_store_url}" \
+          "$${nodes}" 2>&1); then
+          echo "LogService bootstrap completed"
+          exit 0
+        fi
+        if grep -qi "already bootstrap" <<<"$${output}"; then
+          # Only show-ap can confirm that the existing cluster has the expected ID.
+          # Retry it instead of treating an unverified "already bootstrap" as success.
+          sleep 5
+          continue
+        fi
+        safe_output="$${output//$${access_id}/***ID***}"
+        safe_output="$${safe_output//$${access_key}/***KEY***}"
+        echo "LogService bootstrap attempt $${attempt}/60 failed: $${safe_output}; retrying" >&2
+        sleep 5
+      done
+
+      echo "LogService bootstrap failed after 60 attempts" >&2
+      exit 1
+  observer-entrypoint:
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      # Compose starts Observer directly, without the Kubernetes helper that raises
+      # RLIMIT_NOFILE. Docker can inherit a soft limit of 1024 from systemd.
+      ulimit -Sn "$$(ulimit -Hn)"
+
+      home=/home/admin/oceanbase
+      data_dir=/home/admin/data-file
+      log_dir=/home/admin/log
+
+      mkdir -p "$${log_dir}/log" "$${home}/store" \
+        "$${data_dir}/slog" "$${data_dir}/etc" "$${data_dir}/sort_dir" \
+        "$${data_dir}/sstable" "$${data_dir}/wallet"
+      ln -sfn "$${log_dir}/log" "$${home}/log"
+      ln -sfn "$${data_dir}/slog" "$${home}/store/slog"
+      ln -sfn "$${data_dir}/etc" "$${home}/store/etc"
+      ln -sfn "$${data_dir}/sort_dir" "$${home}/store/sort_dir"
+      ln -sfn "$${data_dir}/sstable" "$${home}/store/sstable"
+      ln -sfn "$${data_dir}/wallet" "$${home}/wallet"
+
+      backup_config="$${home}/store/etc/observer.conf.bin"
+      runtime_config="$${home}/etc/observer.config.bin"
+      observer_args=(--nodaemon)
+      if [[ -f "$${backup_config}" ]]; then
+        mkdir -p "$${home}/etc"
+        cp "$${backup_config}" "$${runtime_config}"
+      else
+        options="config_additional_dir=$${home}/store/etc,cpu_count=$${CPU_COUNT},datafile_size=$${DATAFILE_SIZE},datafile_maxsize=$${DATAFILE_MAXSIZE:-38G},datafile_next=$${DATAFILE_NEXT:-4G},enable_syslog_recycle=true,max_syslog_file_count=4,enable_logservice=True,memory_limit=$${MEMORY_LIMIT},__min_full_resource_pool_memory=2147483648"
+        observer_args+=(
+          -m shared_storage
+          --appname "$${CLUSTER_NAME}"
+          --cluster_id "$${CLUSTER_ID}"
+          --zone "$${ZONE_NAME}"
+          -I 127.0.0.1
+          -p 2881
+          -P 2882
+          -d "$${data_dir}"
+          -l info
+          -o "$${options}"
+        )
+      fi
+
+      "$${home}/bin/observer" "$${observer_args[@]}" &
+      observer_pid=$$!
+      # --nodaemon does not refresh a PID file inherited from the base image.
+      # obshell uses this file to determine availability even when SQL is healthy.
+      mkdir -p "$${home}/run"
+      printf '%s\n' "$${observer_pid}" > "$${home}/run/observer.pid"
+      monitoring_register_pid=""
+
+      stop_processes() {
+        trap - TERM INT
+        if [[ -n "$${monitoring_register_pid}" ]] && kill -0 "$${monitoring_register_pid}" 2>/dev/null; then
+          kill -TERM "$${monitoring_register_pid}" 2>/dev/null || true
+          wait "$${monitoring_register_pid}" 2>/dev/null || true
+        fi
+        "$${home}/bin/obshell" agent stop >/dev/null 2>&1 || true
+        if kill -0 "$${observer_pid}" 2>/dev/null; then
+          kill -TERM "$${observer_pid}" 2>/dev/null || true
+          wait "$${observer_pid}" 2>/dev/null || true
+        fi
+      }
+      trap 'stop_processes; exit 143' TERM INT
+
+      for _ in $$(seq 1 180); do
+        if ! kill -0 "$${observer_pid}" 2>/dev/null; then
+          wait "$${observer_pid}"
+          exit $$?
+        fi
+        if bash -c 'exec 3<>/dev/tcp/127.0.0.1/2881' 2>/dev/null; then
+          break
+        fi
+        sleep 1
+      done
+      if ! bash -c 'exec 3<>/dev/tcp/127.0.0.1/2881' 2>/dev/null; then
+        echo "Observer did not open SQL port before the obshell startup deadline" >&2
+        stop_processes
+        exit 1
+      fi
+
+      # Only SQL is needed to bootstrap. Start obshell once the database has
+      # authenticated with its saved password and the monitor account exists.
+      while [[ ! -f /run/secrets/observer_bootstrap_complete ]]; do
+        if ! kill -0 "$${observer_pid}" 2>/dev/null; then
+          wait "$${observer_pid}"
+          exit 1
+        fi
+        sleep 1
+      done
+      root_password="$$(cat /run/secrets/ob_root_password)"
+      rm -f "$${home}/run/daemon.pid"
+      if ! "$${home}/bin/obshell" agent start --ip 127.0.0.1 --password "$${root_password}"; then
+        echo "obshell agent failed to start" >&2
+        stop_processes
+        exit 1
+      fi
+
+      if [[ "$${AUTO_REGISTER_MONITORING:-true}" == true ]]; then
+        bash /opt/oceanseek/obshell-monitoring-register.sh &
+        monitoring_register_pid=$$!
+      fi
+
+      status=0
+      wait "$${observer_pid}" || status=$$?
+      "$${home}/bin/obshell" agent stop >/dev/null 2>&1 || true
+      exit "$${status}"
+  obshell-monitoring-register:
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      socket=$${OBSHELL_SOCKET:-/home/admin/oceanbase/run/obshell.sock}
+      prometheus_url=$${PROMETHEUS_INTERNAL_URL:-http://prometheus:9090/}
+      alertmanager_url=$${ALERTMANAGER_INTERNAL_URL:-http://alertmanager:9093}
+      timeout_seconds=$${MONITORING_REGISTER_TIMEOUT_SECONDS:-600}
+      [[ "$${timeout_seconds}" =~ ^[1-9][0-9]*$$ ]] || {
+        echo "MONITORING_REGISTER_TIMEOUT_SECONDS must be a positive integer" >&2
+        exit 1
+      }
+      deadline=$$((SECONDS + timeout_seconds))
+
+      wait_ready() {
+        local name=$$1
+        local url=$$2
+        until curl -fsS --max-time 3 "$${url%/}/-/ready" >/dev/null 2>&1; do
+          if (( SECONDS >= deadline )); then
+            echo "Timed out waiting for $${name}; automatic obshell registration was skipped" >&2
+            return 1
+          fi
+          sleep 2
+        done
+      }
+
+      register() {
+        local name=$$1
+        local url=$$2
+        local response
+        response=$$(curl -fsS --max-time 10 --unix-socket "$${socket}" \
+          -X PUT "http://localhost/api/v1/system/external/$${name}" \
+          -H 'Content-Type: application/json' \
+          --data-binary "{\"address\":\"$${url}\",\"auth\":{\"username\":\"\",\"password\":\"\"}}")
+        if [[ "$${response}" != *'"successful":true'* ]]; then
+          echo "obshell rejected $${name} registration: $${response}" >&2
+          return 1
+        fi
+        echo "obshell $${name} registered: $${url}"
+      }
+
+      while [[ ! -S "$${socket}" ]]; do
+        if (( SECONDS >= deadline )); then
+          echo "Timed out waiting for obshell socket; automatic monitoring registration was skipped" >&2
+          exit 1
+        fi
+        sleep 1
+      done
+
+      wait_ready prometheus "$${prometheus_url}"
+      wait_ready alertmanager "$${alertmanager_url}"
+      register prometheus "$${prometheus_url}"
+      register alertmanager "$${alertmanager_url}"
+  observer-bootstrap:
+    content: |
+      #!/bin/bash
+      set -euo pipefail
+      umask 077
+      cd /run/secrets
+      root_pw=$$(cat ob_root_password)
+      monitor_pw=$$(cat ob_monitor_password)
+      access_id=$$(cat minio_access_id)
+      access_key=$$(cat minio_access_key)
+      # Only the credentials-init service creates these hexadecimal values.
+      for value in "$$root_pw" "$$monitor_pw" "$$access_id" "$$access_key"; do
+        [[ $$value =~ ^[[:xdigit:]]+$$ ]] || { echo "Invalid credential format" >&2; exit 1; }
+      done
+      for value in "$$ZONE_NAME" "$$OBSERVER_HOST" "$$LOGSERVICE_BUCKET_URL" "$$SHARED_STORAGE_BUCKET_URL"; do
+        [[ $$value =~ ^[a-zA-Z0-9._:/?=\&-]+$$ ]] || { echo "Invalid bootstrap parameter" >&2; exit 1; }
+      done
+      [[ $$LOGSERVICE_CLUSTER_ID =~ ^[0-9]+$$ ]] || exit 1
+
+      # Keep credentials out of process arguments and statement-error output.
+      client_file=$$(mktemp)
+      error_file=$$(mktemp)
+      trap 'rm -f "$$client_file" "$$error_file"' EXIT
+      printf '[client]\npassword=%s\n' "$$root_pw" > "$$client_file"
+      sql() {
+        mariadb "$$1" --no-auto-rehash --batch --skip-column-names --skip-ssl \
+          --protocol=TCP --connect-timeout=5 --host="$$OBSERVER_HOST" --port=2881 --user=root
+      }
+      auth="--defaults-file=$$client_file"
+      count='SELECT COUNT(*) FROM oceanbase.DBA_OB_SERVERS'
+      ready() {
+        local n
+        n=$$(sql "$$1" <<<"$$count" 2>/dev/null) && [[ $$n =~ ^[1-9][0-9]*$$ ]]
+      }
+
+      log_url="$$LOGSERVICE_BUCKET_URL&access_id=$$access_id&access_key=$$access_key&logservice_cluster_id=$$LOGSERVICE_CLUSTER_ID"
+      if [[ -e observer_bootstrap_complete ]]; then
+        # Existing instances may take a while to recover after a stop.
+        until ready "$$auth"; do sleep 3; done
+      elif ! ready "$$auth"; then
+        initial=--no-defaults
+        data_url="$$SHARED_STORAGE_BUCKET_URL&access_id=$$access_id&access_key=$$access_key"
+        until ready "$$initial" || ready "$$auth"; do
+          # Remember an interrupted bootstrap before sending the statement.
+          touch observer_bootstrap_pending
+          if sql "$$initial" >/dev/null 2>"$$error_file" <<SQL
+      ALTER SYSTEM BOOTSTRAP ZONE '$$ZONE_NAME' SERVER '127.0.0.1:2882', LOGSERVICE_ACCESS_POINT "$$log_url" SHARED_STORAGE_INFO "$$data_url";
+      SQL
+          then
+            until ready "$$initial" || ready "$$auth"; do sleep 3; done
+            break
+          fi
+          # The client may echo the SQL (including object-store keys) on failure.
+          code=$$(sed -n 's/^ERROR \([0-9][0-9]*\).*/\1/p' "$$error_file" | head -1)
+          echo "Waiting for Observer bootstrap (SQL error $${code:-unknown})"
+          sleep 5
+        done
+        if ! ready "$$auth"; then
+          [[ -f observer_bootstrap_pending ]] || { echo "Unexpected existing cluster with an empty root password" >&2; exit 1; }
+          sql "$$initial" >/dev/null 2>&1 <<<"ALTER USER root IDENTIFIED BY '$$root_pw'" || {
+            echo "Failed to set the initial root password" >&2; exit 1;
+          }
+        fi
+      fi
+      ready "$$auth" || { echo "Root authentication failed" >&2; exit 1; }
+      if [[ ! -e observer_bootstrap_complete ]]; then
+        # SQL can accept queries after an interrupted bootstrap even if the
+        # LogService access point needed for the next cold start is still empty.
+        saved_ap="SELECT COUNT(*) FROM oceanbase.__all_sys_parameter WHERE name='logservice_access_point' AND LENGTH(value)>0"
+        active_ap="SELECT COUNT(*) FROM oceanbase.GV\$$OB_PARAMETERS WHERE name='logservice_access_point' AND LENGTH(value)>0"
+        if [[ $$(sql "$$auth" <<<"$$saved_ap") == 0 ]]; then
+          sql "$$auth" >/dev/null 2> "$$error_file" <<<"ALTER SYSTEM SET logservice_access_point='$$log_url'" || {
+            echo "Failed to persist the LogService access point" >&2
+            exit 1
+          }
+        fi
+        until [[ $$(sql "$$auth" <<<"$$saved_ap") -ge 1 && $$(sql "$$auth" <<<"$$active_ap") -ge 1 ]]; do sleep 2; done
+      fi
+      sql "$$auth" >/dev/null 2>&1 <<SQL || { echo "Failed to provision the monitoring account" >&2; exit 1; }
+      CREATE USER IF NOT EXISTS monitor IDENTIFIED BY '$$monitor_pw';
+      ALTER USER monitor IDENTIFIED BY '$$monitor_pw';
+      GRANT SELECT ON *.* TO monitor;
+      SQL
+      touch observer_bootstrap_complete
+      rm -f observer_bootstrap_pending
+      until (exec 3<>"/dev/tcp/$$OBSERVER_HOST/2886") 2>/dev/null; do sleep 2; done
+      echo "OceanSeek deployment completed."
+      { read -r sql_host; read -r url_host; } < /run/oceanseek/published-hosts
+      case "$$url_host" in *:*) url_host="[$$url_host]" ;; esac
+      if [[ $$OBSERVER_SQL_HOST_PORT =~ ^[0-9]+$$ && $$OBSERVER_SQL_HOST_PORT != 0 ]]; then
+        printf "OceanBase SQL:\n  mysql -h '%s' -P %s -u 'root@sys' -p\n" "$$sql_host" "$$OBSERVER_SQL_HOST_PORT"
+      else
+        echo "SQL published port: docker compose port cluster-network 2881"
+      fi
+      if [[ $$OBSHELL_HOST_PORT =~ ^[0-9]+$$ && $$OBSHELL_HOST_PORT != 0 ]]; then
+        printf 'obshell Dashboard (user root):\n  http://%s:%s/\n' "$$url_host" "$$OBSHELL_HOST_PORT"
+      else
+        echo "obshell published port: docker compose port cluster-network 2886"
+      fi
+      printf 'Initial password:\n  sudo docker compose exec observer cat /run/secrets/ob_root_password\n'
+  obagent-entrypoint:
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      MONITOR_PASSWORD="$$(cat /run/secrets/ob_monitor_password)"
+      export MONITOR_PASSWORD
+
+      cd /home/admin/obagent
+      # The image templates use loopback for a Kubernetes sidecar. In Compose the
+      # Observer has its own network endpoint and keeps the same service DNS name.
+      sed -i 's/@tcp(127\.0\.0\.1:/@tcp(observer:/g' conf/module_config/monitor_ob*.yaml
+      ./replace_properties.sh
+      exec bin/ob_monagent -c conf/monagent.yaml
+  alertmanager:
+    content: |
+      route:
+        receiver: default
+
+      receivers:
+        - name: default
+  prometheus:
+    content: |
+      global:
+        scrape_interval: 5s
+        evaluation_interval: 5s
+
+      alerting:
+        alertmanagers:
+          - static_configs:
+              - targets: ["alertmanager:9093"]
+
+      scrape_configs:
+        # Keep the Observer instance label across upgrades to the dedicated scrape endpoint.
+        - job_name: obagent-monitor-basic
+          metrics_path: /metrics/ob/basic
+          static_configs:
+            - targets: ["obagent:8088"]
+              labels: {instance: "observer:8088"}
+        - job_name: obagent-monitor-extra
+          metrics_path: /metrics/ob/extra
+          static_configs:
+            - targets: ["obagent:8088"]
+              labels: {instance: "observer:8088"}
+
+# Adapted from the OceanBase ob-operator Compose deployment and startup scripts.
+# Copyright (c) OceanBase. Mulan PSL v2.
+#                              Mulan Permissive Software License，Version 2
+#
+# Mulan Permissive Software License，Version 2 (Mulan PSL v2)
+#
+# January 2020 http://license.coscl.org.cn/MulanPSL2
+#
+# Your reproduction, use, modification and distribution of the Software shall be subject to Mulan PSL v2 (this License) with the following terms and conditions:
+#
+# 0. Definition
+#
+# Software means the program and related documents which are licensed under this License and comprise all Contribution(s).
+#
+# Contribution means the copyrightable work licensed by a particular Contributor under this License.
+#
+# Contributor means the Individual or Legal Entity who licenses its copyrightable work under this License.
+#
+# Legal Entity means the entity making a Contribution and all its Affiliates.
+#
+# Affiliates means entities that control, are controlled by, or are under common control with the acting entity under this License, ‘control’ means direct or indirect ownership of at least fifty percent (50%) of the voting power, capital or other securities of controlled or commonly controlled entity.
+#
+# 1. Grant of Copyright License
+#
+# Subject to the terms and conditions of this License, each Contributor hereby grants to you a perpetual, worldwide, royalty-free, non-exclusive, irrevocable copyright license to reproduce, use, modify, or distribute its Contribution, with modification or not.
+#
+# 2. Grant of Patent License
+#
+# Subject to the terms and conditions of this License, each Contributor hereby grants to you a perpetual, worldwide, royalty-free, non-exclusive, irrevocable (except for revocation under this Section) patent license to make, have made, use, offer for sale, sell, import or otherwise transfer its Contribution, where such patent license is only limited to the patent claims owned or controlled by such Contributor now or in future which will be necessarily infringed by its Contribution alone, or by combination of the Contribution with the Software to which the Contribution was contributed. The patent license shall not apply to any modification of the Contribution, and any other combination which includes the Contribution. If you or your Affiliates directly or indirectly institute patent litigation (including a cross claim or counterclaim in a litigation) or other patent enforcement activities against any individual or entity by alleging that the Software or any Contribution in it infringes patents, then any patent license granted to you under this License for the Software shall terminate as of the date such litigation or activity is filed or taken.
+#
+# 3. No Trademark License
+#
+# No trademark license is granted to use the trade names, trademarks, service marks, or product names of Contributor, except as required to fulfill notice requirements in section 4.
+#
+# 4. Distribution Restriction
+#
+# You may distribute the Software in any medium with or without modification, whether in source or executable forms, provided that you provide recipients with a copy of this License and retain copyright, patent, trademark and disclaimer statements in the Software.
+#
+# 5. Disclaimer of Warranty and Limitation of Liability
+#
+# THE SOFTWARE AND CONTRIBUTION IN IT ARE PROVIDED WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED. IN NO EVENT SHALL ANY CONTRIBUTOR OR COPYRIGHT HOLDER BE LIABLE TO YOU FOR ANY DAMAGES, INCLUDING, BUT NOT LIMITED TO ANY DIRECT, OR INDIRECT, SPECIAL OR CONSEQUENTIAL DAMAGES ARISING FROM YOUR USE OR INABILITY TO USE THE SOFTWARE OR THE CONTRIBUTION IN IT, NO MATTER HOW IT’S CAUSED OR BASED ON WHICH LEGAL THEORY, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGES.
+#
+# 6. Language
+#
+# THIS LICENSE IS WRITTEN IN BOTH CHINESE AND ENGLISH, AND THE CHINESE VERSION AND ENGLISH VERSION SHALL HAVE THE SAME LEGAL EFFECT. IN THE CASE OF DIVERGENCE BETWEEN THE CHINESE AND ENGLISH VERSIONS, THE CHINESE VERSION SHALL PREVAIL.
+#
+# END OF THE TERMS AND CONDITIONS
